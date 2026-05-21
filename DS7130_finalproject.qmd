@@ -1,0 +1,745 @@
+---
+title: "TylerWasif_FinalProject"
+Author: "Tyler Carver & Wasif Mostofa"
+format: html
+editor: visual
+toc: true
+---
+
+![](images/clipboard-3732368387.png)
+
+## Introduction
+
+Our project analyzes whether NBA players are being paid relative to their on-court performance during the 2024–2025 season. The main goal is to understand how player salaries relate to key performance metrics such as points, rebounds, and assists, and to identify players who may be overpaid or underpaid based on their production.
+
+To do this, we used two main data sources. Salary data was collected from Basketball Reference and cleaned to ensure consistency, while performance data was obtained using the nbastatR package (also from Basketball Reference). These datasets were merged so that each player had both salary and performance statistics in a single dataset. Players with very limited playing time were removed to ensure more reliable findings.
+
+After cleaning and merging the data, we conducted exploratory data analysis using visualizations to identify trends and relationships between salary and performance. Then we fit a multiple linear regression model that was used to quantify how performance metrics impact salary. Lastly, we applied clustering techniques to group players with similar performance profiles, providing additional insight into player roles and value.
+
+### Data Processioning
+
+```{r}
+# 1. Setup
+
+library(tidyverse)      
+library(stringi)       
+library(ggrepel)       
+library(patchwork)    
+library(gridExtra)      
+library(plotly)         
+library(cluster)     
+library(NbClust)
+# install once from GitHub:
+# install.packages("remotes")
+# remotes::install_github("abresler/nbastatR")
+library(nbastatR)
+
+# eliminate scientific notation in salaries
+options(scipen = 999)
+library(tidyverse)
+library(readr)
+
+# ============================================================
+# STEP 1 — Load and clean salary CSV
+# ============================================================
+
+salaries_raw <- read_csv("sportsref_download.csv", skip = 1)
+
+# Preview
+glimpse(salaries_raw)
+
+# Function to clean a salary string and return a numeric value
+# Handles inputs like "$59,606,817" or "59606817" or "$59606817"
+
+clean_salary <- function(salary) {
+  
+  cleaned <- c()  # empty vector to store results
+  
+  for (i in salary) {
+    if (is.character(i)) {
+      # if salary is a string, strip $ signs, commas, and whitespace
+      i <- i |>
+        str_remove_all("\\$") |>
+        str_remove_all(",") |>
+        str_trim() |>
+        as.numeric()
+    }
+    cleaned <- c(cleaned, i)
+  }
+  return(cleaned)
+}
+
+# Apply the function inside mutate()
+
+salary_df <- salaries_raw |>
+  select(Player, Tm, `2025-26`) |>
+  rename(salary = `2025-26`) |>
+  filter(!is.na(Player), !is.na(salary)) |>
+  mutate(salary = clean_salary(salary))
+
+#will only have one player per row. keeps highest salary row
+salary_df_clean <- salary_df |>
+  group_by(Player) |>
+  summarize(
+    team   = Tm[which.max(salary)],   # keep team associated with highest salary
+    salary = max(salary),             # keep highest salary value
+    .groups = "drop"
+  )
+
+# Confirm duplicates are gone
+salary_df_clean |>
+  count(Player) |>
+  filter(n > 1)
+
+
+# ============================================================
+# STEP 2 Performance data (nbastatR, 2024-25 regular season)
+# ============================================================
+
+# nbastatR labels seasons by the END year, so 2024-25 = 2025.
+# bref_players_stats() pulls per season averages directly from Basketball Reference
+Sys.setenv(VROOM_CONNECTION_SIZE = 500072)
+
+bref_pg <- nbastatR::bref_players_stats(
+  seasons = 2025,
+  tables  = "per_game"
+)
+
+colnames(bref_pg)
+glimpse(bref_pg)
+
+# rename to match what our downstream plots / model expect.
+# note: bref_players_stats returns groupPosition already bucketed
+# as G / F / C, so we use that directly.
+stats_df <- bref_pg |>
+  select(
+    player_name = namePlayer,
+    position    = groupPosition,
+    GP          = countGames,
+    MPG         = minutesPerGame,
+    PPG         = ptsPerGame,
+    RPG         = trbPerGame,
+    APG         = astPerGame,
+    SPG         = stlPerGame,
+    BPG         = blkPerGame,
+    TOPG        = tovPerGame,
+    PFPG        = pfPerGame,
+    FG_PCT      = pctFG,
+    FG3_PCT     = pctFG3,
+    FT_PCT      = pctFT
+  ) |>
+  # bref lists traded players once per stint plus a "TOT" row.
+  # keep the row with the most games played per player.
+  group_by(player_name) |>
+  slice_max(order_by = GP, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  filter(GP >= 20, !is.na(position))   # drop low GP and missing positions
+
+# Verify
+stats_df |>
+  count(position, sort = TRUE)
+
+# ============================================================
+# STEP 3 — Use a join command to combine Salary and Player Stats
+# ============================================================
+
+# Join stats_df + salary_df
+# inner_join — only keep players with both stats AND a salary
+# names differ between tables so we specify both sides
+
+nba_df <- stats_df |>
+  inner_join(salary_df_clean, by = c("player_name" = "Player"))
+
+
+# Check for any duplicate player rows
+nba_df |>
+  count(player_name) |>
+  filter(n > 1)
+
+# Spot check to confirm if the join method worked
+nba_df |>
+  select(player_name, position, team, salary, GP, PPG, RPG, APG) |>
+  arrange(desc(salary)) |>
+  head(10)
+```
+
+### Data Visualization
+
+```{r}
+# ============================================================
+# STEP 4 — Visualize Data
+# ============================================================
+
+# Histogram
+p1_hist_salarydistribution <- nba_df |>
+  ggplot(aes(x = salary/1e6)) + #dividing by 1e6 to make the Xaxis more readable
+  geom_histogram(bins = 30, fill = "blue", color = "white") +
+  labs(
+    title    = "NBA Player Salary Distribution",
+    caption  = "Data: Basketball Reference + nbastatR",
+    x        = "Salary (USD Millions)",
+    y        = "Number of Players"
+  ) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#Graph1
+p1_hist_salarydistribution #show data
+
+p_top10_salary <- nba_df |>
+  arrange(desc(salary)) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = salary / 1e6, y = reorder(player_name, salary), fill = position)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title   = "Top 10 Highest Paid NBA Players",
+    x       = "Salary (Millions USD)",
+    y       = "Player",
+    fill    = "Position",
+    caption = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+#Graph2
+p_top10_salary #show graph
+
+p_top10_ppg <- nba_df |>
+  arrange(desc(PPG)) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = PPG, y = reorder(player_name, PPG), fill = position)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title   = "Top 10 Scorers in the NBA",
+    x       = "Points Per Game (PPG)",
+    y       = "Player",
+    fill    = "Position",
+    caption = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+#Graph3
+p_top10_ppg #show graph
+
+#Boxplot
+p_salary_position <- nba_df |>
+  ggplot(aes(x = position, y = salary / 1e6, color = position)) +
+  geom_boxplot() +
+  labs(
+    title    = "NBA Salary Distribution by Position",
+    subtitle = "How does pay vary across Guards, Forwards and Centers?",
+    x        = "Position",
+    y        = "Salary (Millions USD)",
+    caption  = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title      = element_text(hjust = 0.5),
+    plot.subtitle   = element_text(hjust = 0.5),
+    legend.position = "none"
+  )
+#Graph4
+p_salary_position
+
+#scatterplot
+p_salary_ppg <- nba_df |>
+  ggplot(aes(x = PPG, y = salary / 1e6)) +
+  geom_point(aes(color = position), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title   = "Salary vs. Points Per Game",
+    x       = "Points Per Game (PPG)",
+    y       = "Salary (Millions USD)",
+    color   = "Position",
+    caption = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5))
+#Graph5
+p_salary_ppg #scatter salary vs PPG
+
+p_salary_rpg <- nba_df |>
+  ggplot(aes(x = RPG, y = salary / 1e6)) +
+  geom_point(aes(color = position), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title   = "Salary vs. Rebounds Per Game",
+    x       = "Rebounds Per Game (RPG)",
+    y       = "Salary (Millions USD)",
+    color   = "Position",
+    caption = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Graph6
+p_salary_rpg #scatter salary vs RPG
+
+p_salary_apg <- nba_df |>
+  ggplot(aes(x = APG, y = salary / 1e6)) +
+  geom_point(aes(color = position), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title   = "Salary vs. Assists Per Game",
+    x       = "Assists Per Game (APG)",
+    y       = "Salary (Millions USD)",
+    color   = "Position",
+    caption = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#Graph7
+p_salary_apg #scatter salary vs APG
+
+
+#adding a new variable (value score = PPG + RPG + APG)
+nba_df <- nba_df |>
+  mutate(
+    salary_M    = salary / 1e6,
+    value_score = (PPG + RPG + APG) / salary_M
+  )
+
+#Graph 8: top 10 most underpaid nba players
+p_underpaid <- nba_df |>
+  arrange(desc(value_score)) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = value_score, y = reorder(player_name, value_score), fill = position)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title    = "Top 10 Most Underpaid NBA Players",
+    subtitle = "Highest production per million dollars earned",
+    x        = "Value Score (PPG + RPG + APG) / Salary (Millions)",
+    y        = "Player",
+    fill     = "Position",
+    caption  = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title    = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+p_underpaid
+
+#Graph 9: top 10 most overderpaid nba players
+p_overpaid <- nba_df |>
+  arrange(value_score) |>
+  slice_head(n = 10) |>
+  ggplot(aes(x = value_score, y = reorder(player_name, value_score), fill = position)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title    = "Top 10 Most Overpaid NBA Players",
+    subtitle = "Lowest production per million dollars earned",
+    x        = "Value Score (PPG + RPG + APG) / Salary (Millions)",
+    y        = "Player",
+    fill     = "Position",
+    caption  = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title    = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+p_overpaid
+
+#Graph 10: Scatter plot of Salary vs Value score
+p_salary_value <- nba_df |>
+  ggplot(aes(x = salary_M, y = value_score)) +
+  geom_point(aes(color = position), alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title    = "NBA Salary vs. Value Score",
+    x        = "Salary (Millions USD)",
+    y        = "Value Score (PPG + RPG + APG) / Salary (Millions)",
+    color    = "Position",
+    caption  = "Data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(
+    plot.title    = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+p_salary_value
+```
+
+### Graph Explanations
+
+**Graph 1 - Distribution of 2025-26 salaries.** A histogram of salary / 1e6 (salary in millions of USD) across all 375 players. A classic right-skewed distribution: the bulk of the NBA is concentrated in the \$1–5M range (rookie scale, minimums, small role-player deals), and the tail stretches out past \$50M for supermax contracts. You see a spike near the league minimum (\~\$2M), a secondary hump in the mid-level exception range (\$10–15M), and a sparse tail of \$30M+ max contracts.
+
+**Graph 2 - Top 10 highest-paid NBA players.** A horizontal bar chart of the 10 players with the highest 2025-26 salary, sorted by salary, colored by position.
+
+**Graph 3 - Top 10 scorers.** A horizontal bar chart of the 10 players with the highest 2024-25 PPG, again colored by position.
+
+**Graph 4 - Salary boxplot by position.** A box-and-whisker plot of salary / 1e6 across the three position buckets (C, F, G). Centers have the highest median salary and the longest upper tail; forwards are close behind; guards have the lowest median with a heavy upper tail (because a handful of superstar guards like Steph Curry sit at the very top). The box heights are similar, but the medians shift in the order C ≥ F \> G, which is exactly what the regression is capturing.
+
+**Graph 5 - Salary vs. Points Per Game.** A scatter plot with PPG on the x-axis and salary / 1e6 on the y-axis, colored by position. A clear upward-sloping linear trend: more points per game, more salary. The slope of the fitted line is roughly \$1.3–1.4M per additional PPG, matching the regression's PPG coefficient of \$1,366,110. Wide vertical scatter at every PPG level - lots of \$5M players and \$25M players all putting up \~15 PPG which is the residual variation the regression cannot explain.
+
+**Graph 6 - Salary vs. Rebounds Per Game.** This is the visualization for a subtle regression finding: in a simple model salary \~ RPG, rebounds look meaningful, but in the multiple regression controlling for PPG, APG, and position, RPG collapses to a non-significant coefficient. A textbook example of confounding.
+
+**Graph 7 - Salary vs. Assists Per Game.** A scatter of salary vs APG, same structure as Graphs 5 and 6. Guards dominate the right side of the x-axis (high APG), but the fitted line still sits lower overall than Graph 5's line, because the guard position dummy drags the intercept down. Interpretation: assists are more valuable per unit, and teams pay for playmaking even more than for scoring.
+
+**Graph 8 - Top 10 most underpaid players.** A bar chart of the 10 players with the highest value_score = (PPG + RPG + APG / salary_M, i.e., players who produce the most counting stats per \$1M of salary. This is a different definition of "underpaid" than the regression residuals: it is a simple ratio and does not control for position or anything else. As a productivity-per-dollar view, it reliably shows rookie contracts and hard-working role players, but it is not the same as being underpaid relative to expectations.
+
+**Graph 9 - Top 10 most overpaid players.** Same as Graph 8 but using the lowest value scores (smallest production / salary ratio). It shows large-salary, small-production players, which are typically: injured stars on supermax deals who missed most of 2024-25 (Kawhi Leonard, Zion Williamson, Joel Embiid seasons with low GP); aging veterans on legacy max contracts whose per-game production has fallen off (Paul George); and players who were traded mid-season and ended up in a reduced role (Cam Thomas, Buddy Hield after leaving the Pacers - neither of which have bad contracts, but they fit the mold nonetheless).
+
+**Graph 10 - Scatter of Salary vs. Value Score.** Every player plotted with salary on x and value score on y, colored by position, with a linear regression line. Points far above the curve for a given salary are local bargains; points far below are local overpays. This pairs naturally with the residual-based over/underpaid lists from the regression.
+
+### Interactive Plots
+
+```{r}
+# ============================================================
+# STEP 7 — create interactive Plots
+# ============================================================
+
+# Salary vs PPG animated by postion (G,F,C)
+library(plotly)
+library(ggplot2)
+plot_ly(
+  data=nba_df,
+  x=~salary,
+  y=~PPG,
+  frame = ~position,
+  type='histogram2d'
+) |>
+  layout(
+    title='NBA Salary vs Points Per Game By Position',
+    xaxis=list(title='Salary'),
+    yaxis=list(title='Points Per Game')
+  )
+
+# Interactive scatter salary vs value score 
+
+p_interactive_value <- nba_df |>
+  ggplot(aes(
+    x     = salary_M,
+    y     = value_score,
+    color = position,
+    text  = paste0(
+      player_name,
+      "<br>Team: ",     team,
+      "<br>Position: ", position,
+      "<br>Salary: $",  round(salary_M, 2), "M",
+      "<br>PPG: ",      round(PPG, 1),
+      "<br>RPG: ",      round(RPG, 1),
+      "<br>APG: ",      round(APG, 1),
+      "<br>Value: ",    round(value_score, 2)
+    )
+  )) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(
+    title   = "NBA Salary vs. Value Score",
+    x       = "Salary (Millions USD)",
+    y       = "Value Score (PPG + RPG + APG) / Salary (Millions)",
+    color   = "Position",
+    caption = "Hover to identify players; data: Basketball Reference + nbastatR"
+  ) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggplotly(p_interactive_value, tooltip = "text")
+
+```
+
+### Interactive Figure Explanations
+
+**Interactive Figure 1 - Salary × PPG, faceted by position.** This produces an animated 2D density / heatmap where hitting Play (or clicking the slider) cycles through the three position groups (C, F, G). For each frame, you see the joint density of salary and PPG as a colored grid: where players cluster most heavily.
+
+-   **Centers:** density concentrates around low-to-moderate PPG (5–15) and moderate salary, with a sparse tail of \$30M+ / 20+ PPG franchise bigs.
+-   **Forwards:** a more even spread across the PPG axis, with density reaching further into the mid-salary band.
+-   **Guards:** the density at the upper-right corner (high PPG + max salary) is lighter than for centers, and guards have a dense blob at low-to-mid PPG with low salary. This is the visual for the guard discount that the positionG coefficient quantified.
+
+**Interactive Figure 2 - Scatter of Salary vs. Value Score with hover.** The same content as Graph 10, but rendered via ggplotly() so every point exposes a hover tooltip containing player name, team, position, salary (in M), PPG / RPG / APG, and value score. The static Graph 10 gives the shape; this interactive version lets you identify individual players by hovering on the outlier dots to see who the bargains and luxuries are without needing a separate label layer.
+
+### Interactive Tables
+
+```{r}
+
+interactive_nba_df <- nba_df |>
+  select(player_name,team,GP,FG_PCT,MPG,PPG,RPG,APG, salary)
+
+#install.packages('DT')
+library(DT)
+datatable(interactive_nba_df)
+```
+
+### Data Analysis (Linear Regression)
+
+```{r}
+# ============================================================
+# Create a linear regression model
+# ============================================================
+
+#multiple linear regression using PPG,Apg,rpg, position as predictors
+#salary as the dependent variable
+lm.salary <- lm(salary~PPG+RPG+APG+position,data=nba_df)
+
+
+summary(lm.salary)
+#Adjusted R Squared Value is 0.6711
+lm.salary
+```
+
+**Coefficient estimates** (salary \~ PPG + RPG + APG + position):
+
+| Term        |   Estimate | Std. Error | t value |  p value |
+|-------------|-----------:|-----------:|--------:|---------:|
+| (Intercept) | -4,990,852 |  1,717,599 |   -2.91 |   0.0039 |
+| PPG         |  1,366,110 |    111,835 |   12.22 | \< 2e-16 |
+| RPG         |     91,703 |    283,746 |    0.32 |    0.747 |
+| APG         |  1,694,643 |    371,597 |    4.56 |  7.0e-06 |
+| positionF   |    515,249 |  1,379,620 |    0.37 |    0.709 |
+| positionG   | -3,414,409 |  1,686,377 |   -2.03 |    0.044 |
+
+**Coefficient interpretation.** Assists are valued more per unit than points, with about \$1.69M per assist compared to \$1.37M per point. Points and assists are on very different scales though, since players average roughly four times as many points as assists, so in total scoring still explains more of the overall salary. But on the margin, an extra assist is paid more than an extra point, which lines up with how teams clearly value primary playmakers. Rebounding, however, is not a meaningful salary driver once you control for everything else: the RPG coefficient is very small and not statistically significant, suggesting teams are not directly paying for rebounds themselves. Instead, they are paying for the overall production bundle: scoring and play making, that often comes with strong rebounders. This also explains why rebounds look important in a simple scatter plot but lose their effect once you control for other variables, a good example of confounding. Position effects also highlight differences in how the market values players. After controlling for the same level of production, guards are paid about \$3.4M less than centers, while forwards are paid roughly the same as centers (the difference is not significant). This likely reflects the fact that guards are more common in the league, which pushes their price down, while productive big men are more scarce and harder to replace, leading to higher salaries even when their basic stats are similar.
+
+**Addressing MLR assumptions.** This analysis is cross-sectional and based on a single season, so it does not capture the fact that salaries reflect multi-year expectations, injuries, contract structures, and extensions. As a result, some players identified as "overpaid" may simply be on legacy max deals or aging contracts, while "underpaid" players are often still on rookie scale contracts or veteran minimums. The model also ignores the hard salary cap structure, where rookie scale and supermax deals create step functions that a linear model cannot capture, which helps explain some of the large residuals. On top of that, the model only includes PPG, APG, RPG, and position, so it omits important factors like efficiency, defense, usage, turnovers, and availability. This means certain player types, especially defensive anchors, may appear overpaid because their contributions are not included in the regression, think Draymond Green. The model also imposes a linearity assumption, where the marginal effect of an additional point is constant across all scoring levels, even though the true relationship is likely nonlinear at the top. Lastly, there is some multicollinearity between PPG and APG, since high-usage players tend to do both, which can inflate standard errors, but the coefficients can still be interpreted as partial effects.
+
+### Data Analysis (K means Clustering)
+
+```{r}
+# ============================================================
+# Create a clustering model
+# ============================================================
+install.packages("cluster")
+library(cluster)
+install.packages("NbClust")
+library(NbClust)
+
+#############Guards Cluster ###############################################
+#will leave salary out since that is the dependent variable
+Guards_data <- nba_df |>
+  filter(position=='G')|>
+  select(PPG,RPG,APG)
+guard_scale <- scale(Guards_data)
+
+# Estimate the best number of clusters from 2 to 10 using k-means criteria
+guard_number_cluster_estimate <- NbClust(
+  guard_scale,
+  distance = "euclidean",
+  min.nc = 2,
+  max.nc = 10,
+  method = "kmeans"
+)
+
+# Show the voting results for the best number of clusters
+guard_number_cluster_estimate$Best.nc
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Run PAM clustering with 5 clusters
+# Note: the slides call this k-means, but this function is PAM
+kmeans_guard_scalecluster <- pam(guard_scale, k = 5)
+
+# Show medoids for the clusters
+kmeans_guard_scalecluster$medoids
+
+# Show the cluster assignment for each row
+kmeans_guard_scalecluster$clustering
+
+# Plot the clustering result in two reduced dimensions
+plot(kmeans_guard_scalecluster)
+
+# Add the assigned cluster to the Guard data
+guard_cluster <- Guards_data %>%
+  mutate(cluster = kmeans_guard_scalecluster$clustering)
+
+# Show the dataset with assigned clusters
+guard_cluster
+
+# Compute the average of each variable by cluster
+guard_cluster_summary <- guard_cluster %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+
+# Show cluster summaries
+guard_cluster_summary
+
+#############Forward Cluster ###############################################
+#will leave salary out since that is the dependent variable
+Forward_data <- nba_df |>
+  filter(position=='F')|>
+  select(PPG,RPG,APG)
+Forward_scale <- scale(Forward_data)
+
+# Estimate the best number of clusters from 2 to 10 using k-means criteria
+forward_number_cluster_estimate <- NbClust(
+  Forward_scale,
+  distance = "euclidean",
+  min.nc = 2,
+  max.nc = 10,
+  method = "kmeans"
+)
+
+# Show the voting results for the best number of clusters
+forward_number_cluster_estimate$Best.nc
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Run PAM clustering with 5 clusters
+# Note: the slides call this k-means, but this function is PAM
+kmeans_forward_scalecluster <- pam(Forward_scale, k = 5)
+
+# Show medoids for the clusters
+kmeans_forward_scalecluster$medoids
+
+# Show the cluster assignment for each row
+kmeans_forward_scalecluster$clustering
+
+# Plot the clustering result in two reduced dimensions
+plot(kmeans_forward_scalecluster)
+
+# Add the assigned cluster to the Guard data
+forward_cluster <- Forward_data %>%
+  mutate(cluster = kmeans_forward_scalecluster$clustering)
+
+# Show the dataset with assigned clusters
+forward_cluster
+
+# Compute the average of each variable by cluster
+forward_cluster_summary <- forward_cluster %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+
+# Show cluster summaries
+forward_cluster_summary
+
+#############Center Cluster ###############################################
+#will leave salary out since that is the dependent variable
+Center_data <- nba_df |>
+  filter(position=='C')|>
+  select(PPG,RPG,APG)
+Center_scale <- scale(Center_data)
+
+# Estimate the best number of clusters from 2 to 10 using k-means criteria
+Center_number_cluster_estimate <- NbClust(
+  Center_scale,
+  distance = "euclidean",
+  min.nc = 2,
+  max.nc = 10,
+  method = "kmeans"
+)
+
+# Show the voting results for the best number of clusters
+Center_number_cluster_estimate$Best.nc
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Run PAM clustering with 5 clusters
+# Note: the slides call this k-means, but this function is PAM
+kmeans_center_scalecluster <- pam(Center_scale, k = 5)
+
+# Show medoids for the clusters
+kmeans_center_scalecluster$medoids
+
+# Show the cluster assignment for each row
+kmeans_center_scalecluster$clustering
+
+# Plot the clustering result in two reduced dimensions
+plot(kmeans_center_scalecluster)
+
+# Add the assigned cluster to the Guard data
+center_cluster <- Center_data %>%
+  mutate(cluster = kmeans_center_scalecluster$clustering)
+
+# Show the dataset with assigned clusters
+center_cluster
+
+# Compute the average of each variable by cluster
+center_cluster_summary <- center_cluster %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)))
+
+# Show cluster summaries
+center_cluster_summary
+```
+
+### Clustering Results
+
+#### Guards (n = 166)
+
+| Cluster | PPG | RPG | APG | Tier / Archetype | Example |
+|-----------:|-----------:|-----------:|-----------:|------------|------------|
+| 2 | 4.4 | 1.3 | 1.4 | End-of-bench / 2 way guards (g league) | Ron Harper Jr. |
+| 1 | 7.3 | 2.4 | 1.5 | Low-usage rotation guard | Keon Ellis, Kris Dunn |
+| 3 | 9.6 | 3.2 | 2.8 | Solid rotation guard/ 6th man | Dennis Schroder, Bones Hyland |
+| 4 | 15.3 | 3.8 | 4.4 | Secondary creators / high end starters | Derrick White, Ajay Mitchell |
+| 5 | 22.9 | 4.9 | 6.7 | All star ball handlers | Jalen Brunson, SGA, Donovan Mitchell |
+
+PPG, RPG, and APG move together from cluster 2 (all = −1 SD) to cluster 5 (all = +1.5 SD or more). The one exception is cluster 3, which has a slightly elevated RPG compared to its scoring: those are bigger, slashing combo guards who get to the paint and rebound a bit more than their points suggest. Guards is the largest bucket (166 players) and the most evenly spread across clusters, which is consistent with the modern NBA being focused on many ball-handling roles.
+
+#### Forwards (n = 141)
+
+| Cluster | PPG | RPG | APG | Tier / Archetype | Example |
+|-----------:|-----------:|-----------:|-----------:|------------|------------|
+| 4 | 3.3 | 1.6 | 0.5 | End-of-bench / deep reserve forward | Carter Bryant, Nicolas Batum |
+| 5 | 6.6 | 3.4 | 1.1 | Low-usage 3&D forward | Jordan Walsh, Nikola Jovic |
+| 2 | 9.8 | 4.1 | 1.8 | 3-and-D / connector wing (rotation forwards) | Tari Eason, Royce O'Neal |
+| 1 | 15.3 | 5.7 | 2.4 | Scoring starters | Aaron Gordon, Jaime Jaquez Jr. |
+| 3 | 20.9 | 7.1 | 4.9 | All star forward / play making wings | Jayson Tatum, Lebron James, Deni Avdija |
+
+It is mostly a tier ladder, but the top cluster (3) stands out because its APG jumps disproportionately. That captures point-forwards / floor generals: the Luka Doncic / Giannis / Kevin Durant-adjacent wing-creator types. Cluster 1 is more like the traditional scoring small forward or power forward who averages \~15/6 without being the primary initiator (think Tobias Harris, Jaden McDaniels). Forwards also have the cleanest separation between clusters 4 and 5 because RPG differentiates them even when PPG is similar.
+
+#### Centers (n = 68)
+
+| Cluster | PPG | RPG | APG | Tier / Archetype | Example |
+|-----------:|-----------:|-----------:|-----------:|------------|------------|
+| 1 | 4.4 | 3.6 | 0.7 | End-of-bench big/ 3rd center | Clint Capela |
+| 2 | 9.5 | 6.1 | 1.9 | Backup / Rotation bigs | Daniel Gafford |
+| 3 | 8.5 | 8.0 | 1.0 | Screen-setter / rim-protector / glass-cleaner (rebound first low usage bigs) | Mitchell Robinson |
+| 5 | 14.3 | 9.9 | 2.3 | All-Star caliber traditional bigs | Jalen Duren |
+| 4 | 22.1 | 11.8 | 4.1 | Franchise centers | Jokic / Wembanyama |
+
+Centers is where the k = 5 choice is most interesting, because you can see two different mid-tier archetypes:
+
+-   **Cluster 2 (9.5 / 6.1 / 1.9):** balanced backup big - scores a little, rebounds a little (think Jusuf Nurkic, Jakob Poeltl).
+-   **Cluster 3 (8.5 / 8.0 / 1.0):** scores less than cluster 2 but rebounds *more* and passes less. This is the classic screen-setter / rim-protector / glass-cleaner archetype (think Steven Adams).
+
+That is a genuine difference in player roles, not just a tier difference. Clusters 4 and 5 are both star bigs; the gap between them is the gap between an All-Star and an MVP-tier big man, and only a handful of players land in cluster 4. Centers is also the smallest group (68 players), so its clusters are more sensitive to individual outliers than the guard / forward splits.
+
+#### Cross-position interpretation
+
+Tying the clusters back to the regression residuals: a superstar in guard cluster 5 or center cluster 4 who still has a large positive residual is overpaid even relative to elite production - i.e., on a max contract but past their prime, (think Paul George, Joel Embiid). Conversely, a player in the "low-usage rotation" clusters (guard C1, forward C5, center C2 / C3) with a large negative residual is exactly the "cheap useful role player" the team values more than the market does; typically a rookie-scale or vet-minimum guy.
+
+## Conclusion
+
+Overall, the results show that NBA salaries are strongly influenced by offensive production, particularly scoring and assists. Players responsible for scoring more and creating opportunities for others tend to earn significantly higher salaries. We found that not all performance metrics are equally valued, as rebounding was not a significant predictor in the model.
+
+Visualizations also highlight inefficiencies in the market. Some players provide high production relative to their salary and can be considered underpaid, while others are on large contracts without matching performance, making them overpaid. The negative relationship between salary and value score further supports this idea.
+
+The clustering analysis reinforces that players fall into distinct performance tiers, ranging from low-impact role players to superstars. It suggests that teams may be paying based on perceived player roles rather than strictly on statistical efficiency.
+
+In conclusion, while NBA salaries are partially aligned with performance, there are clear inconsistencies. Teams heavily reward scoring and playmaking, but overall value is not always reflected in the salary, leading to both overpaid and underpaid players league wide.
+
+### GeoTag
+
+```{r}
+#install.packages("leaflet")
+library(leaflet)
+leaflet() |>
+  addTiles()|>
+  addMarkers(
+    lng = -84.5184,
+    lat = 33.9384,
+    popup = 'KSU Marietta'
+  )
+  
+```
+
+### QR Code
+
+```{r}
+#install.packages('qrcode')
+library(qrcode)
+#will need to update URL once final draft is complete
+qr <- qr_code('https://rpubs.com/wmostofa/1424378')
+plot(qr)
+```
